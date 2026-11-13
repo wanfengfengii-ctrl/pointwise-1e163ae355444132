@@ -1,7 +1,15 @@
+import ast
+import inspect
 import json
 import random
 import sys
+from pathlib import Path
+
+import demand
+import driver
+import vectors
 from columns import Columns
+from demand import Complete, DemandKernel, Paused
 from expr import E
 from scan import scan
 from reference import scan as reference
@@ -210,7 +218,211 @@ def regression():
     print("BEHAVIOR_REGRESSION_OK")
 
 
+def drive(kernel, node, rows, columns):
+    """Run one kernel request, answering column demands from ``columns``."""
+    demanded = []
+    result = kernel.evaluate(node, rows)
+    while isinstance(result, Paused):
+        demanded.append((result.column, list(result.rows)))
+        result = kernel.resume(result, [columns[result.column][i]
+                                       for i in result.rows])
+    assert isinstance(result, Complete), result
+    return result.values, demanded
+
+
+def kernel_and_operator_checks():
+    # Independent kernel run with hand-made column responses, including the
+    # documented shared node: [0,2,3] then [1,2], where row 2 is cached NULL.
+    q = E("div", E("lit", 20), E("col", "x"))
+    kernel = DemandKernel()
+    x = {0: 2, 1: 4, 2: None, 3: 5}
+    assert drive(kernel, q, [0, 2, 3], {"x": x}) == (
+        [10.0, None, 4.0], [("x", [0, 2, 3])])
+    values, demanded = drive(kernel, q, [1, 2], {"x": x})
+    assert values == [5.0, None]
+    assert demanded == [("x", [1])]  # cached NULL row 2 is not missing work
+
+    # Empty demand at the kernel: no column demand at all.
+    assert drive(DemandKernel(), E("col", "cold"), [], {}) == ([], [])
+    assert drive(DemandKernel(), E("lit", 3), [], {}) == ([], [])
+
+    # Pause handoff: each resume advances the same walk and keeps its frames.
+    branch = E("div", E("col", "a"),
+               E("if", E("col", "c"), E("lit", 1), E("col", "absent")))
+    values, demanded = drive(DemandKernel(), branch, [0, 1],
+                             {"a": {0: 2, 1: 2}, "c": {0: True, 1: False},
+                              "absent": {1: 2}})
+    assert demanded == [("a", [0, 1]), ("c", [0, 1]), ("absent", [1])]
+    assert values == [2.0, 1.0]
+
+    # A failing node is not cached, but its finished child cells remain: a
+    # retry reuses both child vectors and fails again without new reads.
+    failing = E("div", E("col", "p"), E("col", "z"))
+    kernel = DemandKernel()
+    try:
+        drive(kernel, failing, [0, 1], {"p": [1, 1], "z": [1, 0]})
+    except ZeroDivisionError as exc:
+        assert exc.args == ("division by zero",)
+    else:
+        raise AssertionError("zero division swallowed")
+    try:
+        result = kernel.evaluate(failing, [0, 1])
+    except ZeroDivisionError as exc:
+        assert exc.args == ("division by zero",)  # no new column demands
+    else:
+        raise AssertionError("cached child vectors lost")
+    # Unknown operators fail from the operator table, not from graph walking.
+    try:
+        DemandKernel().evaluate(E("bogus", E("lit", 1)), [0])
+    except ValueError as exc:
+        assert exc.args == ("operator:bogus",)
+    else:
+        raise AssertionError("unknown operator accepted")
+
+    # Local operator calls carry no Expr: only a name, payload, rows, vectors.
+    rows = [0, 1, 2]
+    assert vectors.step("col", "x", rows, {}) == vectors.NeedColumn(
+        "x", rows)
+    assert vectors.step("lit", 7, rows, {}).values == [7, 7, 7]
+    assert isinstance(vectors.step("gt", None, rows, {}),
+                      vectors.NeedChild)
+    child = vectors.step("gt", None, rows, {0: [1, 2, 3]})
+    assert (child.index, child.rows) == (1, rows)
+    left = [True, False, None]
+    short = vectors.step("and", None, rows, {0: left})
+    assert (short.index, short.rows) == (1, [0, 2])
+    assert vectors.step("and", None, rows,
+                        {0: left, 1: [False, True]}).values == [
+        False, False, None]
+    short = vectors.step("or", None, rows, {0: left})
+    assert (short.index, short.rows) == (1, [1, 2])
+    branch = vectors.step("if", None, rows, {0: [True, False, None]})
+    assert (branch.index, branch.rows) == (1, [0])
+    branch = vectors.step("if", None, rows,
+                          {0: [True, False, None], 1: [10]})
+    assert (branch.index, branch.rows) == (2, [1, 2])
+    assert vectors.step("div", None, [0, 1],
+                        {0: [1, None], 1: [2, 0]}).values == [0.5, None]
+
+
+def driver_checks():
+    # The read driver works with a replaced column source and keeps laziness.
+    source = Recording([{"x": [1, 2]}])
+    x = E("col", "x")
+    assert list(scan(source, E("lit", True), {"a": x, "b": x}, 1)) == [
+        {"a": 1, "b": 1}, {"a": 2, "b": 2}]
+    assert source.trace == [["group", 0], ["read", 0, "x", [0]],
+                            ["read", 0, "x", [1]]]  # cache is per batch
+    source = Recording([{"x": [1]}, {"x": [2]}])
+    stream = scan(source, E("lit", True), {"v": E("col", "x")}, 1)
+    assert next(stream) == {"v": 1}
+    stream.close()
+    assert source.trace == [["group", 0], ["read", 0, "x", [0]]]
+
+    # The driver itself only reads through the source protocol; a source that
+    # only implements groups/read is enough.
+    class Bare:
+        def __init__(self):
+            self.calls = []
+
+        def groups(self):
+            return iter([(0, 2)])
+
+        def read(self, group, name, rows):
+            self.calls.append((group, name, list(rows)))
+            return [10 for _ in rows]
+
+    bare = Bare()
+    assert list(scan(bare, E("lit", True), {"v": E("col", "any")}, 2)) == [
+        {"v": 10}, {"v": 10}]
+    assert bare.calls == [(0, "any", [0, 1])]
+
+
+def _module_ast(name):
+    return ast.parse(Path(name + ".py").read_text(encoding="utf-8"))
+
+
+def _imported(module):
+    names = set()
+    for node in ast.walk(module):
+        if isinstance(node, ast.Import):
+            names.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            names.add((node.module or "").split(".")[0])
+    return names
+
+
+def _string_constants(module):
+    return {node.value for node in ast.walk(module)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)}
+
+
+def _attributes(module):
+    return {node.attr for node in ast.walk(module)
+            if isinstance(node, ast.Attribute)}
+
+
+def boundary_checks():
+    scan_ast, driver_ast = _module_ast("scan"), _module_ast("driver")
+    demand_ast, vectors_ast = _module_ast("demand"), _module_ast("vectors")
+
+    # Dependencies may only point driver -> demand -> vectors.
+    assert _imported(vectors_ast) == set()
+    assert _imported(demand_ast) <= {"vectors"}
+    assert _imported(driver_ast) <= {"demand", "vectors"}
+    assert "columns" not in _imported(demand_ast) | _imported(driver_ast)
+    assert "reference" not in (_imported(scan_ast) | _imported(driver_ast)
+                               | _imported(demand_ast) | _imported(vectors_ast))
+    for module in (scan_ast, driver_ast, demand_ast, vectors_ast):
+        assert not ({"importlib", "__import__", "sys"} & _imported(module))
+        assert not ({"importlib", "__import__", "modules"}
+                    & _string_constants(module))
+
+    # scan.py is a pure forwarder: one imported executor, one delegating def.
+    funcs = [node for node in scan_ast.body
+             if isinstance(node, ast.FunctionDef)]
+    assert [node.name for node in funcs] == ["scan"]
+    body = funcs[0].body
+    assert len(body) == 2, body  # docstring + return
+    assert isinstance(body[-1], ast.Return)
+    assert isinstance(body[-1].value, ast.Call)
+    assert _imported(scan_ast) == {"driver"}
+
+    # demand.py does not branch on concrete operators or cell values.
+    assert not ({"col", "lit", "eq", "gt", "div", "and", "or", "if"}
+                & _string_constants(demand_ast))
+    # driver does the I/O only through the source; the operator layer has none.
+    assert not ({"read", "open", "source", "group"}
+                & _attributes(vectors_ast))
+    # driver.py does not walk or interpret expressions.
+    assert not ({"op", "args"} & _attributes(driver_ast))
+    assert not ({"col", "lit", "eq", "gt", "div", "and", "or", "if"}
+                & _string_constants(driver_ast))
+    assert "expr" not in (_imported(driver_ast) | _imported(demand_ast)
+                          | _imported(vectors_ast))
+
+    # Handoff signatures: no source/callback reaches the kernel, no Expr
+    # reaches the operator.
+    assert list(inspect.signature(DemandKernel.__init__).parameters) == ["self"]
+    assert list(inspect.signature(DemandKernel.evaluate).parameters) == [
+        "self", "node", "rows"]
+    assert list(inspect.signature(DemandKernel.resume).parameters) == [
+        "self", "paused", "values"]
+    assert list(inspect.signature(vectors.step).parameters) == [
+        "op", "payload", "rows", "children"]
+    assert not ({"source", "read", "callback", "expr", "node"}
+                & set(inspect.signature(vectors.step).parameters))
+
+
+def structure():
+    kernel_and_operator_checks()
+    driver_checks()
+    boundary_checks()
+    print("STRUCTURE_OK")
+
+
 if __name__ == "__main__":
     if sys.argv[1:] != ["verify"]:
         raise SystemExit("usage: python3 checks.py verify")
     regression()
+    structure()
