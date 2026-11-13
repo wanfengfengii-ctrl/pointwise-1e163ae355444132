@@ -1,0 +1,20 @@
+[
+  {
+    "rows": 4,
+    "columns": {
+      "gate": "g0.json",
+      "x": "x0.json",
+      "fallback": "f0.json",
+      "want": "w0.json"
+    }
+  },
+  {
+    "rows": 2,
+    "columns": {
+      "gate": "g1.json",
+      "x": "x1.json",
+      "fallback": "f1.json",
+      "want": "w1.json"
+    }
+  }
+]
